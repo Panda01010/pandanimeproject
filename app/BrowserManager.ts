@@ -1523,13 +1523,18 @@ export async function watchAndDownloadGrid(
         if (attemptedIds.has(id)) continue;
         attemptedIds.add(id);
 
-        // 1. Open Detail View
+        // 1. Open Detail View — wait for the Download button, same as character pipeline
         await thumb.click();
-        await page.waitForSelector('aside, [role="dialog"], .sc-c7ee1759-0', { state: 'visible', timeout: 5000 }).catch(() => {});
-        
-        // 2. Extract and Verify Prompt
+        await page.waitForSelector(
+          'button:has-text("Download"), button[aria-label*="download" i]',
+          { state: 'visible', timeout: 8000 }
+        ).catch(() => {
+          log('Download button did not appear after thumbnail click — continuing anyway');
+        });
+
+        // 2. Extract and Verify Prompt — use the same fast function as character pipeline
         log(`verifying sidebar prompt for grid ${gridIndex + 1}...`);
-        const sidebarPrompt = await extractSidebarPrompt(page);
+        const sidebarPrompt = await extractAndExpandSidebarPrompt(page);
         
         const normSidebar = sidebarPrompt.replace(/\s+/g, ' ').trim();
         const normTarget = targetPrompt.replace(/\s+/g, ' ').trim();
@@ -1569,12 +1574,10 @@ export async function watchAndDownloadGrid(
         const filename = `${targetTitle}.png`;
         const destPath = path.join(downloadPath, filename);
 
-        // 4. Rename Scene Title
-        const currentTitle = await extractFlowTitle(page);
-        if (currentTitle !== targetTitle) {
-            await renameFlowTitle(page, targetTitle);
-            log(`renamed grid scene title to "${targetTitle}"`);
-        }
+        // 4. Rename Scene Title — always rename immediately, no pre-read needed
+        await renameFlowTitle(page, targetTitle);
+        log(`renamed grid scene title to "${targetTitle}"`);
+
 
         // 5. Download Variation
         try {
@@ -1587,7 +1590,7 @@ export async function watchAndDownloadGrid(
         }
 
         await page.keyboard.press('Escape');
-        await page.waitForTimeout(400);
+        await page.waitForTimeout(150); // fast yield matching character pipeline
     }
 
     if (loopProgress) {
