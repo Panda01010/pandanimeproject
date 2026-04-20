@@ -41,6 +41,11 @@ export default function Home() {
   const [viewingExtracted, setViewingExtracted] = useState<number | null>(null);
   const [lastTick, setLastTick] = useState(Date.now());
   const [generatingProgress, setGeneratingProgress] = useState<{ gridIndex: number; phase: string; pct: number } | null>(null);
+  const [generatingAllGrids, setGeneratingAllGrids] = useState(false);
+  const [generatingAllQueue, setGeneratingAllQueue] = useState<{ current: number; total: number; currentGridIndex: number } | null>(null);
+  const [generatedGrids, setGeneratedGrids] = useState<number[]>([]); // persisted in metadata.json
+  const [extractingAll, setExtractingAll] = useState(false);
+  const [extractingAllQueue, setExtractingAllQueue] = useState<{ current: number; total: number; currentGridIndex: number } | null>(null);
   const [shotSources, setShotSources] = useState<Record<string, string>>({});
   const [editingShot, setEditingShot] = useState<string | null>(null);
   const [characters, setCharacters] = useState<{ id: string; name: string; description: string; generated?: boolean }[]>([]);
@@ -83,6 +88,25 @@ export default function Home() {
   const [editingVideoInProgress, setEditingVideoInProgress] = useState<string | null>(null);
   const [upscalingVideoShot, setUpscalingVideoShot] = useState<string | null>(null);
   const [expandedPrompts, setExpandedPrompts] = useState<Record<string, boolean>>({});
+
+  // ── Real-time pipeline progress (SSE) ──────────────────────────────────────
+  type PipelineKey = 'character' | 'grid' | 'extraction' | 'video';
+  interface PipelineProgress {
+    label: string;
+    step: number;
+    total: number;
+    pct: number;
+    subLabel?: string;
+    done?: boolean;
+    error?: boolean;
+    ts: number; // last-updated timestamp
+  }
+  const [pipelineProgress, setPipelineProgress] = useState<Record<PipelineKey, PipelineProgress | null>>({
+    character: null,
+    grid: null,
+    extraction: null,
+    video: null,
+  });
 
   const addLog = (message: string) => {
     const entry = `${new Date().toISOString()} ${message}`;
@@ -139,6 +163,7 @@ export default function Home() {
       setShotSources(data.shotSources || {});
       setShotAssignments(data.shotAssignments || {});
       setCharacters(Array.isArray(data.characters) ? data.characters : []);
+      if (Array.isArray(data.generatedGrids)) setGeneratedGrids(data.generatedGrids);
       if (data.videoSources) setVideoSources(data.videoSources);
       if (data.videoOriginalSources) setVideoOriginalSources(data.videoOriginalSources);
       if (data.videoPrompts) setVideoPrompts(data.videoPrompts);
@@ -163,6 +188,37 @@ export default function Home() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
+
+  // ── SSE: live pipeline progress ────────────────────────────────────────────
+  useEffect(() => {
+    const es = new EventSource('/api/progress');
+    es.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (!data.pipeline) return;
+        setPipelineProgress(prev => ({
+          ...prev,
+          [data.pipeline as PipelineKey]: {
+            label: data.label,
+            step: data.step,
+            total: data.total,
+            pct: data.pct,
+            subLabel: data.subLabel,
+            done: data.done,
+            error: data.error,
+            ts: Date.now(),
+          },
+        }));
+        // Auto-clear 4s after a pipeline marks itself done
+        if (data.done || data.error) {
+          setTimeout(() => {
+            setPipelineProgress(prev => ({ ...prev, [data.pipeline as PipelineKey]: null }));
+          }, 4000);
+        }
+      } catch { /* ignore parse errors */ }
+    };
+    return () => es.close();
   }, []);
 
   // Live Heartbeat Sync
@@ -223,6 +279,7 @@ export default function Home() {
     setImageApprovals(refreshData.imageApprovals || {});
     setLastTick(Date.now());
     setCharacters(Array.isArray(refreshData.characters) ? refreshData.characters : []);
+    if (Array.isArray(refreshData.generatedGrids)) setGeneratedGrids(refreshData.generatedGrids);
     if (Array.isArray(refreshData.gridDescriptions)) setGridDescriptions(refreshData.gridDescriptions);
     if (Array.isArray(refreshData.generatedVideos)) setGeneratedVideos(refreshData.generatedVideos);
     if (refreshData.videoSources && typeof refreshData.videoSources === 'object') setVideoSources(refreshData.videoSources);
@@ -620,6 +677,211 @@ export default function Home() {
     }
   };
 
+  /** Run all approved grids sequentially: submit → watch/download → next */
+  const handleGenerateAllGrids = async () => {
+    if (!activeProjectName) { setStatus('No active project'); return; }
+    if (generatingProgress || generatingAllGrids) return;
+
+    const approvedIndexes = gridApprovals.reduce<number[]>((acc, approved, idx) => {
+      if (approved) acc.push(idx);
+      return acc;
+    }, []);
+
+    if (approvedIndexes.length === 0) {
+      setStatus('No approved grids to generate');
+      return;
+    }
+
+    setGeneratingAllGrids(true);
+    addLog(`Generate All started: ${approvedIndexes.length} approved grids`);
+
+    let skippedCount = 0;
+
+    for (let i = 0; i < approvedIndexes.length; i++) {
+      const gridIndex = approvedIndexes[i];
+
+      // ── Skip grids that already have a "created" tag (images downloaded to disk) ──
+      if (generatedGrids.includes(gridIndex)) {
+        addLog(`[Generate All] Grid ${gridIndex + 1} already created — skipping`);
+        skippedCount++;
+        continue;
+      }
+
+      setGeneratingAllQueue({ current: i + 1, total: approvedIndexes.length, currentGridIndex: gridIndex });
+      setSelectedGridIndex(gridIndex);
+
+      // ── Phase A: Submit ─────────────────────────────────────────
+      const remaining = approvedIndexes.length - skippedCount;
+      const processed = i + 1 - skippedCount;
+      setStatus(`Grid ${gridIndex + 1} — submitting (${processed}/${remaining})`);
+      setGeneratingProgress({ gridIndex, phase: 'Submitting prompt to AI Flow...', pct: 8 });
+      addLog(`[Generate All] submitting Grid ${gridIndex + 1}`);
+
+      const submitRes = await fetch('/api/open-browser', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'open-ai-flow', projectName: activeProjectName, gridIndex }),
+      });
+      const submitData = await submitRes.json();
+      if (!submitRes.ok) {
+        setGeneratingProgress(null);
+        addLog(`[Generate All] Grid ${gridIndex + 1} submit failed: ${submitData.error}`);
+        setStatus(`Grid ${gridIndex + 1} failed — skipping`);
+        await new Promise(r => setTimeout(r, 1500));
+        continue;
+      }
+      setBrowserOpen(true);
+
+      // ── Phase B: Watch + Download ─────────────────────────────
+      setStatus(`Grid ${gridIndex + 1} — waiting for images (${processed}/${remaining})`);
+      setGeneratingProgress({ gridIndex, phase: 'Waiting for AI Flow to generate 2 images...', pct: 25 });
+      addLog(`[Generate All] watching Grid ${gridIndex + 1}`);
+
+      let animPct = 25;
+      const animInterval = setInterval(() => {
+        animPct = Math.min(animPct + 0.7, 85);
+        setGeneratingProgress(prev => prev ? { ...prev, pct: animPct } : null);
+      }, 800);
+
+      try {
+        const watchRes = await fetch('/api/open-browser', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'watch-and-download', projectName: activeProjectName, gridIndex }),
+        });
+        clearInterval(animInterval);
+        const watchData = await watchRes.json();
+
+        if (watchRes.ok && watchData.savedPaths?.length > 0) {
+          setGeneratingProgress({ gridIndex, phase: `✓ Downloaded ${watchData.savedPaths.length} images`, pct: 100 });
+          setStatus(`Grid ${gridIndex + 1} done (${processed}/${remaining})`);
+          addLog(`[Generate All] Grid ${gridIndex + 1} complete: ${watchData.savedPaths.length} files`);
+          // Update the in-memory created-tag immediately (also persisted in metadata.json on backend)
+          setGeneratedGrids(prev => Array.from(new Set([...prev, gridIndex])));
+          setProjectGridImages(prev => [...new Set([...prev, ...(watchData.savedPaths.map((p: string) => p.split(/[\\/]/).pop()))])]);
+          await refreshProjectState(activeProjectName);
+          setTimeout(() => setGeneratingProgress(null), 1500);
+          await new Promise(r => setTimeout(r, 1500));
+        } else {
+          clearInterval(animInterval);
+          setGeneratingProgress(null);
+          addLog(`[Generate All] Grid ${gridIndex + 1} watch failed: ${watchData.error}`);
+          setStatus(`Grid ${gridIndex + 1} watch failed — skipping`);
+          await new Promise(r => setTimeout(r, 1500));
+        }
+      } catch (err) {
+        clearInterval(animInterval);
+        setGeneratingProgress(null);
+        addLog(`[Generate All] Grid ${gridIndex + 1} error: ${err instanceof Error ? err.message : String(err)}`);
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+
+    setGeneratingAllGrids(false);
+    setGeneratingAllQueue(null);
+    setGeneratingProgress(null);
+    await refreshProjectState(activeProjectName);
+    const doneCount = approvedIndexes.length - skippedCount;
+    setStatus(`✓ Done — ${doneCount} generated, ${skippedCount} already had images (skipped)`);
+    addLog(`[Generate All] finished — ${doneCount} generated, ${skippedCount} skipped`);
+  };
+
+  /** Extract shots for all grids that have an approved image — sequentially */
+  const handleExtractAll = async () => {
+    if (!activeProjectName || extractingAll) return;
+
+    // Collect ONLY grids where user has explicitly assigned shots via slot buttons
+    const approvedGrids = gridBlocks.reduce<{ gridIdx: number; approvedFile: string }[]>((acc, _, gridIdx) => {
+      const assigned = shotAssignments[gridIdx] ?? {};
+      if (Object.keys(assigned).length === 0) return acc; // skip grids with no assignments
+      const gridStrNew = `Grid ${gridIdx + 1}`;
+      const gridStrOld = `Grid-${gridIdx + 1}`;
+      const theseImages = projectGridImages.filter(f =>
+        f.includes(gridStrOld) || f.startsWith(gridStrNew + '.') || f.startsWith(gridStrNew + ' ')
+      );
+      const approvedFile = imageApprovals[String(gridIdx)] ?? imageApprovals[gridIdx as any] ?? theseImages[0];
+      if (approvedFile) acc.push({ gridIdx, approvedFile });
+      return acc;
+    }, []);
+
+    if (approvedGrids.length === 0) {
+      setStatus('No grids have shot assignments yet — assign shots using the slot buttons first');
+      return;
+    }
+
+    setExtractingAll(true);
+    addLog(`Extract All started: ${approvedGrids.length} grids with shot assignments`);
+
+    let skipped = 0;
+
+    for (let i = 0; i < approvedGrids.length; i++) {
+      const { gridIdx, approvedFile } = approvedGrids[i];
+
+      // Skip grids that already have all 9 shots extracted
+      const alreadyExtracted = (extractedShots[gridIdx] ?? []).length;
+      if (alreadyExtracted >= 9) {
+        addLog(`[Extract All] Grid ${gridIdx + 1} already has ${alreadyExtracted} shots — skipping`);
+        skipped++;
+        continue;
+      }
+
+      setExtractingAllQueue({ current: i + 1 - skipped, total: approvedGrids.length - skipped, currentGridIndex: gridIdx });
+      setStatus(`Extracting Grid ${gridIdx + 1} (${i + 1 - skipped}/${approvedGrids.length - skipped})...`);
+      addLog(`[Extract All] extracting Grid ${gridIdx + 1} from ${approvedFile}`);
+
+      // Respect custom per-slot assignments for this grid
+      const gridAssignments = shotAssignments[gridIdx] ?? {};
+      const assignedSlotsCount = Object.keys(gridAssignments).length;
+      const buildPayload = () =>
+        Array.from({ length: 9 }, (_, i) => i + 1).map(slot => ({
+          shotIndex: slot,
+          filename: gridAssignments[slot] ?? approvedFile,
+        }));
+
+      const payload: Record<string, unknown> = {
+        action: 'extract-shot',
+        gridIndex: gridIdx,
+        filename: approvedFile,
+        projectName: activeProjectName,
+        minDelay: minExtDelay,
+        maxDelay: maxExtDelay,
+      };
+      if (assignedSlotsCount > 0) payload.shotAssignments = buildPayload();
+
+      try {
+        const res = await fetch('/api/open-browser', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (res.ok) {
+          addLog(`[Extract All] Grid ${gridIdx + 1} extraction complete`);
+          // Refresh extracted shots state
+          const refreshRes = await fetch('/api/open-browser');
+          if (refreshRes.ok) {
+            const d = await refreshRes.json();
+            if (d.extractedShots) setExtractedShots(d.extractedShots);
+          }
+        } else {
+          const err = await res.json().catch(() => ({}));
+          addLog(`[Extract All] Grid ${gridIdx + 1} failed: ${(err as any).error ?? 'unknown'}`);
+          setStatus(`Grid ${gridIdx + 1} extraction failed — skipping`);
+        }
+      } catch (err) {
+        addLog(`[Extract All] Grid ${gridIdx + 1} error: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
+    setExtractingAll(false);
+    setExtractingAllQueue(null);
+    await refreshProjectState(activeProjectName);
+    const done = approvedGrids.length - skipped;
+    setStatus(`✓ Extract All done — ${done} extracted, ${skipped} already had shots (skipped)`);
+    addLog(`[Extract All] finished — ${done} extracted, ${skipped} skipped`);
+  };
+
   const handleDetectReady = async () => {
     if (!activeProjectName) return;
     setDetectingReady(true);
@@ -786,10 +1048,70 @@ export default function Home() {
           </div>
         </header>
 
+        {/* ── Live Pipeline Progress Panel ── */}
+        {(() => {
+          const pipelines: { key: PipelineKey; label: string; color: string; icon: string }[] = [
+            { key: 'character', label: 'Characters',  color: '#a78bfa', icon: '👤' },
+            { key: 'grid',      label: 'Grid Foundry', color: '#38bdf8', icon: '🎨' },
+            { key: 'extraction',label: 'Extraction',  color: '#fb923c', icon: '✂️' },
+            { key: 'video',     label: 'Video',        color: '#4ade80', icon: '🎬' },
+          ];
+          const activePipelines = pipelines.filter(p => pipelineProgress[p.key] !== null);
+          if (activePipelines.length === 0) return null;
+          return (
+            <div style={{
+              background: '#0a0a0a', border: '1px solid #1e1e2e', borderRadius: 20,
+              padding: '20px 24px', display: 'flex', flexDirection: 'column', gap: 16,
+              boxShadow: '0 0 40px rgba(99,102,241,0.1)',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#6366f1', boxShadow: '0 0 8px #6366f1', animation: 'sseblip 1.5s infinite' }} />
+                <span style={{ fontSize: 11, fontWeight: 700, color: '#6366f1', letterSpacing: 1.2, textTransform: 'uppercase' }}>Pipeline Activity</span>
+              </div>
+              {activePipelines.map(({ key, label, color, icon }) => {
+                const prog = pipelineProgress[key]!;
+                return (
+                  <div key={key} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontSize: 14 }}>{icon}</span>
+                        <span style={{ fontSize: 12, fontWeight: 600, color, letterSpacing: 0.3 }}>{label}</span>
+                        {prog.subLabel && (
+                          <span style={{ fontSize: 11, color: '#555', background: '#111', padding: '2px 8px', borderRadius: 6, border: '1px solid #222' }}>
+                            {prog.subLabel}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <span style={{ fontSize: 11, color: '#444' }}>Step {prog.step}/{prog.total}</span>
+                        <span style={{ fontSize: 12, fontWeight: 700, color: prog.done ? '#4ade80' : prog.error ? '#f87171' : color }}>{prog.pct}%</span>
+                      </div>
+                    </div>
+                    <div style={{ height: 6, background: '#111', borderRadius: 99, overflow: 'hidden', border: '1px solid #1a1a1a' }}>
+                      <div style={{
+                        height: '100%', width: `${prog.pct}%`, borderRadius: 99, transition: 'width 0.5s ease',
+                        background: prog.done ? '#4ade80' : prog.error ? '#f87171' : `linear-gradient(90deg, ${color}88, ${color})`,
+                        boxShadow: prog.done ? '0 0 8px #4ade80' : `0 0 10px ${color}55`,
+                      }} />
+                    </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      {!prog.done && !prog.error && <span style={{ display: 'inline-block', width: 6, height: 6, borderRadius: '50%', background: color, animation: 'sseblip 1s infinite' }} />}
+                      {prog.done && <span style={{ color: '#4ade80', fontSize: 13 }}>✓</span>}
+                      {prog.error && <span style={{ color: '#f87171', fontSize: 13 }}>✗</span>}
+                      <span style={{ fontSize: 11, color: prog.done ? '#4ade80' : prog.error ? '#f87171' : '#888' }}>{prog.label}</span>
+                    </div>
+                  </div>
+                );
+              })}
+              <style>{`@keyframes sseblip { 0%,100%{opacity:1} 50%{opacity:0.35} }`}</style>
+            </div>
+          );
+        })()}
+
         {/* Navigation Tabs */}
         <div style={{ display: 'flex', gap: 8, padding: 8, background: '#0a0a0a', border: '1px solid #1a1a1a', borderRadius: 16, width: 'fit-content', boxShadow: '0 10px 30px rgba(0,0,0,0.2)' }}>
           {[
-        { name: '1. Vault', id: 'project' },
+            { name: '1. Vault', id: 'project' },
             { name: '2. Script Engine', id: 'script' },
             { name: '3. Characters', id: 'characters' },
             { name: '4. Grid Foundry', id: 'grids' },
@@ -1444,14 +1766,91 @@ export default function Home() {
                 <div>
                   <h2 style={{ margin: '0 0 12px', fontSize: 24, fontWeight: 500, color: '#fff', letterSpacing: '-0.02em' }}>Grid Foundry</h2>
                   <p style={{ margin: 0, color: '#888', fontSize: 15, lineHeight: 1.6, maxWidth: 600 }}>Review individual extracted grids, modify parameters, and approve them for bulk image generation.</p>
+
+                  {/* ── Stats row ── */}
+                  {(() => {
+                    const totalGrids   = gridBlocks.length;
+                    const approved     = approvedGridIndexes.length;
+                    const created      = approvedGridIndexes.filter(i => generatedGrids.includes(i)).length;
+                    const pending      = approved - created;
+                    return totalGrids > 0 ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 16, flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ fontSize: 11, color: '#555', textTransform: 'uppercase', letterSpacing: 0.8, fontWeight: 600 }}>Total</span>
+                          <span style={{ fontSize: 16, fontWeight: 700, color: '#fff' }}>{totalGrids}</span>
+                        </div>
+                        <div style={{ width: 1, height: 12, background: '#222' }} />
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#4ade80' }} />
+                          <span style={{ fontSize: 12, color: '#aaa' }}>Approved</span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: '#4ade80' }}>{approved}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#22c55e' }} />
+                          <span style={{ fontSize: 12, color: '#aaa' }}>Created</span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: '#22c55e' }}>{created}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#6366f1' }} />
+                          <span style={{ fontSize: 12, color: '#aaa' }}>To generate</span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: pending > 0 ? '#a78bfa' : '#555' }}>{pending}</span>
+                        </div>
+                      </div>
+                    ) : null;
+                  })()}
                 </div>
-                <button
-                  onClick={handleGenerateImages}
-                  disabled={!approvedGridIndexes.length}
-                  style={{ padding: '14px 24px', borderRadius: 12, border: 'none', background: approvedGridIndexes.length ? '#fff' : '#1a1a1a', color: approvedGridIndexes.length ? '#000' : '#555', fontSize: 14, fontWeight: 600, cursor: approvedGridIndexes.length ? 'pointer' : 'not-allowed' }}
-                >
-                  Submit {approvedGridIndexes.length} Approved Grids
-                </button>
+
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 10, alignItems: 'flex-end' }}>
+                  {/* Generate All — shows exact pending count */}
+                  {(() => {
+                    const pendingToGenerate = approvedGridIndexes.filter(i => !generatedGrids.includes(i)).length;
+                    const hasWork = pendingToGenerate > 0;
+                    const isDisabled = generatingAllGrids || !!generatingProgress || !hasWork;
+                    return (
+                      <>
+                        <button
+                          onClick={handleGenerateAllGrids}
+                          disabled={isDisabled}
+                          style={{
+                            padding: '14px 24px', borderRadius: 12, border: 'none', fontSize: 14, fontWeight: 600,
+                            cursor: isDisabled ? 'not-allowed' : 'pointer',
+                            background: generatingAllGrids ? '#1a1a1a' : hasWork ? 'linear-gradient(135deg, #6366f1, #8b5cf6)' : '#1a1a1a',
+                            color: isDisabled ? '#555' : '#fff',
+                            display: 'flex', alignItems: 'center', gap: 8,
+                            boxShadow: isDisabled ? 'none' : '0 0 20px rgba(99,102,241,0.3)',
+                            transition: 'all 0.2s',
+                          }}
+                        >
+                          {generatingAllGrids && generatingAllQueue ? (
+                            <>
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+                              Grid {generatingAllQueue.currentGridIndex + 1} &nbsp;·&nbsp; {generatingAllQueue.current}/{generatingAllQueue.total}
+                            </>
+                          ) : hasWork ? (
+                            <>⚡ Generate All <span style={{ opacity: 0.7, fontSize: 12 }}>({pendingToGenerate} pending)</span></>
+                          ) : (
+                            <>✓ All grids created</>
+                          )}
+                        </button>
+
+                        {generatingAllGrids && generatingAllQueue && (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 220 }}>
+                            <div style={{ height: 4, background: '#111', borderRadius: 99, overflow: 'hidden' }}>
+                              <div style={{
+                                height: '100%', borderRadius: 99, transition: 'width 0.5s ease',
+                                width: `${Math.round((generatingAllQueue.current / generatingAllQueue.total) * 100)}%`,
+                                background: 'linear-gradient(90deg, #6366f1, #8b5cf6)',
+                              }} />
+                            </div>
+                            <span style={{ fontSize: 11, color: '#555', textAlign: 'right' }}>
+                              {generatingAllQueue.current} of {generatingAllQueue.total} grids
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
               </div>
 
               <div style={{ display: 'grid', gridTemplateColumns: '260px 1fr', gap: 32 }}>
@@ -1463,14 +1862,35 @@ export default function Home() {
                     {gridBlocks.map((_, index) => {
                       const isApproved = gridApprovals[index];
                       const isSelected = index === selectedGridIndex;
+                      const isCurrentlyGenerating = generatingAllGrids && generatingAllQueue?.currentGridIndex === index;
+                      const isCreated = generatedGrids.includes(index);
                       return (
                         <button
                           key={index}
                           onClick={() => handleSelectGrid(index)}
-                          style={{ textAlign: 'left', padding: '14px 16px', borderRadius: 12, border: '1px solid', borderColor: isSelected ? '#444' : '#1a1a1a', background: isSelected ? '#111' : '#050505', color: isApproved ? '#fff' : '#aaa', cursor: 'pointer', transition: 'all 0.15s ease', fontSize: 14, fontWeight: isSelected ? 500 : 400, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}
+                          style={{
+                            textAlign: 'left', padding: '14px 16px', borderRadius: 12, border: '1px solid',
+                            borderColor: isCurrentlyGenerating ? '#6366f1' : isCreated ? '#22c55e33' : isSelected ? '#444' : '#1a1a1a',
+                            background: isCurrentlyGenerating ? 'rgba(99,102,241,0.08)' : isCreated && !isSelected ? 'rgba(34,197,94,0.04)' : isSelected ? '#111' : '#050505',
+                            color: isApproved ? '#fff' : '#aaa',
+                            cursor: 'pointer', transition: 'all 0.15s ease', fontSize: 14,
+                            fontWeight: isSelected ? 500 : 400, display: 'flex', justifyContent: 'space-between', alignItems: 'center'
+                          }}
                         >
-                          <span>Grid {index + 1}</span>
-                          {isApproved && <div style={{ width: 18, height: 18, borderRadius: '50%', background: '#4ade80', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#000', fontSize: 10, fontWeight: 'bold' }}>✓</div>}
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                            <span>Grid {index + 1}</span>
+                            {isCreated && (
+                              <span style={{ fontSize: 10, color: '#4ade80', fontWeight: 600, letterSpacing: 0.5 }}>
+                                ✓ created
+                              </span>
+                            )}
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            {isCurrentlyGenerating && (
+                              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#6366f1" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+                            )}
+                            {isApproved && !isCurrentlyGenerating && <div style={{ width: 18, height: 18, borderRadius: '50%', background: '#4ade80', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#000', fontSize: 10, fontWeight: 'bold' }}>✓</div>}
+                          </div>
                         </button>
                       );
                     })}
@@ -1551,14 +1971,167 @@ export default function Home() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: 40, animation: 'fadeIn 0.3s ease' }}>
               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
                 <div>
-                  <h2 style={{ margin: '0 0 8px 0', fontSize: 24, fontWeight: 700, letterSpacing: -0.5 }}>Grid Assets</h2>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+                    <h2 style={{ margin: 0, fontSize: 24, fontWeight: 700, letterSpacing: -0.5 }}>Grid Assets</h2>
+                    <button
+                      onClick={async () => {
+                        if (!activeProjectName) return;
+                        const r = await fetch('/api/open-browser');
+                        if (r.ok) {
+                          const d = await r.json();
+                          if (d.extractedShots) setExtractedShots(d.extractedShots);
+                          if (d.projectGridImages) setProjectGridImages(d.projectGridImages);
+                        }
+                      }}
+                      title="Refresh counts from disk"
+                      style={{ padding: '4px 10px', borderRadius: 6, border: '1px solid #333', background: '#111', color: '#888', fontSize: 11, cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4 }}
+                    >
+                      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
+                      Refresh
+                    </button>
+                  </div>
                   <p style={{ margin: 0, color: '#666', fontSize: 14 }}>
-                    Review downloaded grids and approve the best variation for extraction.
+                    Assign shots from each grid variation, then Extract All. Files saved as <code style={{ color: '#a78bfa', fontSize: 12 }}>grid1_1.png … grid18_9.png</code>
                   </p>
+
+                  {/* Stats row */}
+                  {(() => {
+                    const totalWithImages = gridBlocks.filter((_, i) => {
+                      const s = `Grid ${i + 1}`; const o = `Grid-${i + 1}`;
+                      return projectGridImages.some(f => f.includes(o) || f.startsWith(s + '.') || f.startsWith(s + ' '));
+                    }).length;
+                    const extractedCount = gridBlocks.filter((_, i) => (extractedShots[i] ?? []).length >= 9).length;
+                    const pendingExtract = totalWithImages - extractedCount;
+                    return totalWithImages > 0 ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 12, flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ fontSize: 11, color: '#555', textTransform: 'uppercase', letterSpacing: 0.8, fontWeight: 600 }}>With images</span>
+                          <span style={{ fontSize: 15, fontWeight: 700, color: '#fff' }}>{totalWithImages}</span>
+                        </div>
+                        <div style={{ width: 1, height: 12, background: '#222' }} />
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#fb923c' }} />
+                          <span style={{ fontSize: 12, color: '#aaa' }}>Extracted</span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: '#fb923c' }}>{extractedCount}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#38bdf8' }} />
+                          <span style={{ fontSize: 12, color: '#aaa' }}>To extract</span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: pendingExtract > 0 ? '#38bdf8' : '#555' }}>{pendingExtract}</span>
+                        </div>
+                      </div>
+                    ) : null;
+                  })()}
                 </div>
-                <div style={{ padding: '8px 16px', background: '#111', border: '1px solid #222', borderRadius: 8, fontSize: 12, color: '#888' }}>
-                  {gridBlocks.length} sequences mapped
-                </div>
+
+                {/* ── Extract All panel (shot count + delay + button) ── */}
+                {(() => {
+                  // For each grid with assignments, count only slots NOT yet on disk
+                  const assignedGrids = gridBlocks.reduce<{ gridIdx: number; approvedFile: string; remainingCount: number; totalCount: number }[]>((acc, _, i) => {
+                    const assigned = shotAssignments[i] ?? {};
+                    const totalCount = Object.keys(assigned).length;
+                    if (totalCount === 0) return acc; // skip grids with no selections at all
+                    const s = `Grid ${i + 1}`; const o = `Grid-${i + 1}`;
+                    const imgs = projectGridImages.filter(f => f.includes(o) || f.startsWith(s + '.') || f.startsWith(s + ' '));
+                    const approvedFile = imageApprovals[String(i)] ?? imageApprovals[i as any] ?? imgs[0];
+                    // Count slots whose file is NOT yet on disk
+                    const extractedFilenames = new Set(extractedShots[i] ?? []);
+                    const remainingCount = Object.keys(assigned).filter(slot => {
+                      const key = `grid${i + 1}_${slot}.png`;
+                      return !extractedFilenames.has(key);
+                    }).length;
+                    if (approvedFile) acc.push({ gridIdx: i, approvedFile, remainingCount, totalCount });
+                    return acc;
+                  }, []);
+                  const totalRemainingShots = assignedGrids.reduce((s, g) => s + g.remainingCount, 0);
+                  const totalAssignedShots = assignedGrids.reduce((s, g) => s + g.totalCount, 0);
+                  const gridsWithWork = assignedGrids.filter(g => g.remainingCount > 0);
+                  const hasWork = gridsWithWork.length > 0;
+                  const isDisabled = extractingAll || !hasWork;
+
+                  return (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'flex-end' }}>
+
+                      {/* Shot count summary */}
+                      <div style={{ textAlign: 'right' }}>
+                        <div style={{ fontSize: 28, fontWeight: 800, color: hasWork ? '#fb923c' : '#4ade80', lineHeight: 1 }}>
+                          {totalRemainingShots}
+                        </div>
+                        <div style={{ fontSize: 11, color: '#555', marginTop: 2, textTransform: 'uppercase', letterSpacing: 0.8 }}>
+                          shots remaining
+                        </div>
+                        <div style={{ fontSize: 11, color: '#444', marginTop: 2 }}>
+                          {totalAssignedShots - totalRemainingShots}/{totalAssignedShots} already done
+                        </div>
+                      </div>
+
+                      {/* Delay controls */}
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10, background: '#050505', border: '1px solid #1a1a1a', borderRadius: 10, padding: '10px 14px' }}>
+                        <span style={{ fontSize: 10, fontWeight: 700, color: '#555', textTransform: 'uppercase', letterSpacing: 0.8 }}>Delay</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <label style={{ fontSize: 11, color: '#666' }}>Min</label>
+                          <input
+                            type="number" min={1} max={maxExtDelay} value={minExtDelay}
+                            onChange={e => setMinExtDelay(Math.max(1, Math.min(Number(e.target.value), maxExtDelay)))}
+                            style={{ width: 48, padding: '5px 6px', borderRadius: 6, border: '1px solid #333', background: '#0a0a0a', color: '#fff', fontSize: 13, outline: 'none', textAlign: 'center' }}
+                          />
+                        </div>
+                        <span style={{ color: '#444', fontSize: 12 }}>–</span>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                          <label style={{ fontSize: 11, color: '#666' }}>Max</label>
+                          <input
+                            type="number" min={minExtDelay} max={120} value={maxExtDelay}
+                            onChange={e => setMaxExtDelay(Math.max(minExtDelay, Math.min(Number(e.target.value), 120)))}
+                            style={{ width: 48, padding: '5px 6px', borderRadius: 6, border: '1px solid #333', background: '#0a0a0a', color: '#fff', fontSize: 13, outline: 'none', textAlign: 'center' }}
+                          />
+                        </div>
+                        <span style={{ fontSize: 10, color: '#555' }}>{minExtDelay}s–{maxExtDelay}s</span>
+                      </div>
+
+                      {/* Extract All button */}
+                      <button
+                        onClick={handleExtractAll}
+                        disabled={isDisabled}
+                        style={{
+                          padding: '14px 24px', borderRadius: 12, border: 'none', fontSize: 14, fontWeight: 600,
+                          cursor: isDisabled ? 'not-allowed' : 'pointer',
+                          background: extractingAll ? '#1a1a1a' : hasWork ? 'linear-gradient(135deg, #fb923c, #f97316)' : '#1a1a1a',
+                          color: isDisabled ? '#555' : '#fff',
+                          display: 'flex', alignItems: 'center', gap: 8, width: '100%', justifyContent: 'center',
+                          boxShadow: isDisabled ? 'none' : '0 0 20px rgba(251,146,60,0.3)',
+                          transition: 'all 0.2s',
+                        }}
+                      >
+                        {extractingAll && extractingAllQueue ? (
+                          <>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+                            Grid {extractingAllQueue.currentGridIndex + 1} &nbsp;·&nbsp; {extractingAllQueue.current}/{extractingAllQueue.total}
+                          </>
+                        ) : hasWork ? (
+                          <>✂️ Extract All  <span style={{ opacity: 0.7, fontSize: 12 }}>({totalRemainingShots} remaining)</span></>
+                        ) : (
+                          <>✓ All done — {totalAssignedShots} shots extracted</>
+                        )}
+                      </button>
+
+                      {/* Queue progress bar */}
+                      {extractingAll && extractingAllQueue && (
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: '100%' }}>
+                          <div style={{ height: 4, background: '#111', borderRadius: 99, overflow: 'hidden' }}>
+                            <div style={{
+                              height: '100%', borderRadius: 99, transition: 'width 0.5s ease',
+                              width: `${Math.round((extractingAllQueue.current / extractingAllQueue.total) * 100)}%`,
+                              background: 'linear-gradient(90deg, #fb923c, #f97316)',
+                            }} />
+                          </div>
+                          <span style={{ fontSize: 11, color: '#555', textAlign: 'right' }}>
+                            Grid {extractingAllQueue.currentGridIndex + 1} &nbsp;·&nbsp; {extractingAllQueue.current} of {extractingAllQueue.total} grids
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
 
               {gridBlocks.length === 0 ? (
@@ -1598,11 +2171,6 @@ export default function Home() {
                             <span style={{ fontSize: 11, color: '#a78bfa', fontWeight: 600, padding: '3px 8px', background: 'rgba(167,139,250,0.1)', borderRadius: 6, border: '1px solid rgba(167,139,250,0.2)' }}>
                               {assignedSlotsCount}/9 shots assigned
                             </span>
-                          )}
-                          {(imageApprovals[String(gridIdx)] ?? imageApprovals[gridIdx as any]) ? (
-                            <span style={{ fontSize: 12, color: '#4ade80', fontWeight: 600, padding: '4px 8px', background: 'rgba(74, 222, 128, 0.1)', borderRadius: 6 }}>✓ Approved</span>
-                          ) : (
-                            <span style={{ fontSize: 12, color: '#888', fontWeight: 500 }}>Pending Approval</span>
                           )}
                           {/* Direct Extract Button */}
                           {approvedFile && (
@@ -1675,20 +2243,15 @@ export default function Home() {
                               const claimedCount = claimedSlots.length;
 
                               return (
-                                <div className="image-card" key={idx} style={{ display: 'flex', flexDirection: 'column', gap: 0, background: isApproved ? 'rgba(74, 222, 128, 0.03)' : '#050505', border: isApproved ? '1px solid #4ade80' : claimedCount > 0 ? '1px solid rgba(167,139,250,0.4)' : '1px solid #1a1a1a', borderRadius: 20, overflow: 'hidden', transition: 'all 0.2s ease' }}>
+                                <div className="image-card" key={idx} style={{ display: 'flex', flexDirection: 'column', gap: 0, background: '#050505', border: claimedCount > 0 ? '1px solid rgba(167,139,250,0.4)' : '1px solid #1a1a1a', borderRadius: 20, overflow: 'hidden', transition: 'all 0.2s ease' }}>
                                   <div style={{ position: 'relative', aspectRatio: '16/9', background: '#000' }}>
                                     <img
                                       src={`/api/assets/${activeProjectName}/grids/${filename}`}
                                       alt={filename}
                                       style={{ width: '100%', height: '100%', objectFit: 'contain' }}
                                     />
-                                    {isApproved && (
-                                      <div style={{ position: 'absolute', top: 12, left: 12, padding: '6px', background: '#4ade80', borderRadius: '50%', color: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', width: 24, height: 24 }}>
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg>
-                                      </div>
-                                    )}
                                     {claimedCount > 0 && (
-                                      <div style={{ position: 'absolute', top: 12, left: isApproved ? 44 : 12, padding: '3px 8px', background: 'rgba(167,139,250,0.85)', backdropFilter: 'blur(6px)', borderRadius: 6, fontSize: 10, color: '#fff', fontWeight: 700 }}>
+                                      <div style={{ position: 'absolute', top: 12, left: 12, padding: '3px 8px', background: 'rgba(167,139,250,0.85)', backdropFilter: 'blur(6px)', borderRadius: 6, fontSize: 10, color: '#fff', fontWeight: 700 }}>
                                         {claimedCount} shot{claimedCount > 1 ? 's' : ''} claimed
                                       </div>
                                     )}
@@ -1752,19 +2315,12 @@ export default function Home() {
                                     </div>
                                   </div>
 
-                                  {/* Approve/Delete row */}
-                                  <div style={{ padding: '12px 14px 14px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                                    <div style={{ fontSize: 12, color: '#555', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{filename}</div>
-                                    <div style={{ display: 'flex', gap: 8 }}>
-                                      {!isApproved ? (
-                                        <button onClick={() => handleApproveGridImage(gridIdx, filename)} style={{ flex: 1, padding: '8px', background: '#fff', color: '#000', border: 'none', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>✓ Approve as Source</button>
-                                      ) : (
-                                        <button onClick={() => handleApproveGridImage(gridIdx, null)} style={{ flex: 1, padding: '8px', background: 'transparent', color: '#f87171', border: '1px solid rgba(248, 113, 113, 0.3)', borderRadius: 8, fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>✕ Reject</button>
-                                      )}
-                                      <button onClick={() => handleDeleteGridImage(filename)} style={{ width: 34, padding: '8px', background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.2)', borderRadius: 8, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center' }} title="Delete Image">
-                                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
-                                      </button>
-                                    </div>
+                                  {/* Bottom row: filename + delete */}
+                                  <div style={{ padding: '12px 14px 14px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                                    <div style={{ fontSize: 12, color: '#555', flex: 1, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{filename}</div>
+                                    <button onClick={() => handleDeleteGridImage(filename)} style={{ width: 34, padding: '8px', background: 'rgba(239, 68, 68, 0.1)', border: '1px solid rgba(239, 68, 68, 0.2)', borderRadius: 8, cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }} title="Delete Image">
+                                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18"></path><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"></path><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>
+                                    </button>
                                   </div>
                                 </div>
                               );
@@ -1804,48 +2360,130 @@ export default function Home() {
 
           {activeTab === 'extraction' && (
             <div style={{ display: 'flex', flexDirection: 'column', gap: 40, animation: 'fadeIn 0.3s ease' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
-              <div>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 24, flexWrap: 'wrap' }}>
+                <div>
                   <h2 style={{ margin: '0 0 12px', fontSize: 24, fontWeight: 500, color: '#fff', letterSpacing: '-0.02em' }}>Extraction Flow</h2>
-                  <p style={{ margin: 0, color: '#888', fontSize: 15, lineHeight: 1.6, maxWidth: 600 }}>Launch Grok to extract and manage your approved Grid Assets into final videos.</p>
+                  <p style={{ margin: 0, color: '#888', fontSize: 15, lineHeight: 1.6, maxWidth: 600 }}>Launch Grok to extract your assigned shots into final images.</p>
+
+                  {/* Stats row */}
+                  {(() => {
+                    const assignedGridCount = Object.keys(shotAssignments).length;
+                    const totalShotsExtracted = Object.values(extractedShots).reduce((s, arr) => s + arr.length, 0);
+                    const extractedGridCount = Object.keys(extractedShots).length;
+                    const pendingGrids = assignedGridCount - extractedGridCount;
+                    return assignedGridCount > 0 ? (
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 16, marginTop: 12, flexWrap: 'wrap' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#4ade80' }} />
+                          <span style={{ fontSize: 12, color: '#aaa' }}>Assigned grids</span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: '#4ade80' }}>{assignedGridCount}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#fb923c' }} />
+                          <span style={{ fontSize: 12, color: '#aaa' }}>Shots extracted</span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: '#fb923c' }}>{totalShotsExtracted}</span>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <div style={{ width: 8, height: 8, borderRadius: '50%', background: '#38bdf8' }} />
+                          <span style={{ fontSize: 12, color: '#aaa' }}>Grids remaining</span>
+                          <span style={{ fontSize: 14, fontWeight: 700, color: pendingGrids > 0 ? '#38bdf8' : '#555' }}>{pendingGrids}</span>
+                        </div>
+                      </div>
+                    ) : null;
+                  })()}
                 </div>
 
-                {/* Shot delay controls */}
-                <div style={{ display: 'flex', alignItems: 'center', gap: 12, background: '#050505', border: '1px solid #1a1a1a', borderRadius: 14, padding: '14px 20px' }}>
-                  <span style={{ fontSize: 11, fontWeight: 700, color: '#555', textTransform: 'uppercase', letterSpacing: 0.8, whiteSpace: 'nowrap' }}>Shot Delay</span>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <label style={{ fontSize: 12, color: '#666', whiteSpace: 'nowrap' }}>Min&nbsp;(s)</label>
-                    <input
-                      id="min-ext-delay"
-                      type="number"
-                      min={1}
-                      max={maxExtDelay}
-                      value={minExtDelay}
-                      onChange={e => setMinExtDelay(Math.max(1, Math.min(Number(e.target.value), maxExtDelay)))}
-                      style={{ width: 60, padding: '7px 10px', borderRadius: 8, border: '1px solid #333', background: '#0a0a0a', color: '#fff', fontSize: 14, outline: 'none', textAlign: 'center' }}
-                    />
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 12, alignItems: 'flex-end' }}>
+                  {/* ── Extract All button ── */}
+                  {(() => {
+                    const pendingExtract = Object.keys(shotAssignments).filter(
+                      k => (extractedShots[Number(k)] ?? []).length < Object.keys(shotAssignments[Number(k)] ?? {}).length
+                    ).length;
+                    const hasWork = pendingExtract > 0;
+                    const isDisabled = extractingAll || !hasWork;
+                    return (
+                      <>
+                        <button
+                          onClick={handleExtractAll}
+                          disabled={isDisabled}
+                          style={{
+                            padding: '14px 28px', borderRadius: 12, border: 'none', fontSize: 15, fontWeight: 600,
+                            cursor: isDisabled ? 'not-allowed' : 'pointer',
+                            background: extractingAll ? '#1a1a1a' : hasWork ? 'linear-gradient(135deg, #fb923c, #f97316)' : '#1a1a1a',
+                            color: isDisabled ? '#555' : '#fff',
+                            display: 'flex', alignItems: 'center', gap: 8,
+                            boxShadow: isDisabled ? 'none' : '0 0 24px rgba(251,146,60,0.35)',
+                            transition: 'all 0.2s',
+                          }}
+                        >
+                          {extractingAll && extractingAllQueue ? (
+                            <>
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" style={{ animation: 'spin 1s linear infinite' }}><path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" /></svg>
+                              Grid {extractingAllQueue.currentGridIndex + 1} &nbsp;·&nbsp; {extractingAllQueue.current}/{extractingAllQueue.total}
+                            </>
+                          ) : hasWork ? (
+                            <>✂️ Extract All <span style={{ opacity: 0.7, fontSize: 12 }}>({pendingExtract} pending)</span></>
+                          ) : (
+                            <>✓ All shots extracted</>
+                          )}
+                        </button>
+
+                        {extractingAll && extractingAllQueue && (
+                          <div style={{ display: 'flex', flexDirection: 'column', gap: 4, width: 220 }}>
+                            <div style={{ height: 4, background: '#111', borderRadius: 99, overflow: 'hidden' }}>
+                              <div style={{
+                                height: '100%', borderRadius: 99, transition: 'width 0.5s ease',
+                                width: `${Math.round((extractingAllQueue.current / extractingAllQueue.total) * 100)}%`,
+                                background: 'linear-gradient(90deg, #fb923c, #f97316)',
+                              }} />
+                            </div>
+                            <span style={{ fontSize: 11, color: '#555', textAlign: 'right' }}>
+                              {extractingAllQueue.current} of {extractingAllQueue.total} grids
+                            </span>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
+
+                  {/* Shot delay controls */}
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 12, background: '#050505', border: '1px solid #1a1a1a', borderRadius: 14, padding: '14px 20px' }}>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: '#555', textTransform: 'uppercase', letterSpacing: 0.8, whiteSpace: 'nowrap' }}>Shot Delay</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <label style={{ fontSize: 12, color: '#666', whiteSpace: 'nowrap' }}>Min&nbsp;(s)</label>
+                      <input
+                        id="min-ext-delay"
+                        type="number"
+                        min={1}
+                        max={maxExtDelay}
+                        value={minExtDelay}
+                        onChange={e => setMinExtDelay(Math.max(1, Math.min(Number(e.target.value), maxExtDelay)))}
+                        style={{ width: 60, padding: '7px 10px', borderRadius: 8, border: '1px solid #333', background: '#0a0a0a', color: '#fff', fontSize: 14, outline: 'none', textAlign: 'center' }}
+                      />
+                    </div>
+                    <span style={{ color: '#444' }}>–</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <label style={{ fontSize: 12, color: '#666', whiteSpace: 'nowrap' }}>Max&nbsp;(s)</label>
+                      <input
+                        id="max-ext-delay"
+                        type="number"
+                        min={minExtDelay}
+                        max={120}
+                        value={maxExtDelay}
+                        onChange={e => setMaxExtDelay(Math.max(minExtDelay, Math.min(Number(e.target.value), 120)))}
+                        style={{ width: 60, padding: '7px 10px', borderRadius: 8, border: '1px solid #333', background: '#0a0a0a', color: '#fff', fontSize: 14, outline: 'none', textAlign: 'center' }}
+                      />
+                    </div>
+                    <span style={{ fontSize: 11, color: '#555', whiteSpace: 'nowrap' }}>{minExtDelay}s – {maxExtDelay}s</span>
                   </div>
-                  <span style={{ color: '#444' }}>–</span>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                    <label style={{ fontSize: 12, color: '#666', whiteSpace: 'nowrap' }}>Max&nbsp;(s)</label>
-                    <input
-                      id="max-ext-delay"
-                      type="number"
-                      min={minExtDelay}
-                      max={120}
-                      value={maxExtDelay}
-                      onChange={e => setMaxExtDelay(Math.max(minExtDelay, Math.min(Number(e.target.value), 120)))}
-                      style={{ width: 60, padding: '7px 10px', borderRadius: 8, border: '1px solid #333', background: '#0a0a0a', color: '#fff', fontSize: 14, outline: 'none', textAlign: 'center' }}
-                    />
-                  </div>
-                  <span style={{ fontSize: 11, color: '#555', whiteSpace: 'nowrap' }}>{minExtDelay}s – {maxExtDelay}s</span>
                 </div>
               </div>
 
-              {Object.keys(imageApprovals).length === 0 ? (
+              {Object.keys(shotAssignments).length === 0 && Object.keys(extractedShots).length === 0 ? (
                 <div style={{ padding: 80, textAlign: 'center', background: '#050505', border: '1px dashed #1a1a1a', borderRadius: 24 }}>
-                  <div style={{ fontSize: 40, marginBottom: 16 }}>✅</div>
-                  <h3 style={{ margin: '0 0 8px 0', color: '#fff' }}>No Approved Images</h3>
+                  <div style={{ fontSize: 40, marginBottom: 16 }}>🎬</div>
+                  <h3 style={{ margin: '0 0 8px 0', color: '#fff' }}>No shots assigned yet</h3>
+                  <p style={{ color: '#555', margin: 0 }}>Go to Grid Assets, assign slot buttons, then come back to extract.</p>
                 </div>
               ) : viewingExtracted !== null ? (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -1943,17 +2581,16 @@ export default function Home() {
                           )}
                           {/* Regenerate Shot button — re-extracts just this one shot from Grok */}
                           {(() => {
-                            const shotId = shotFile.split('.')[0];
-                            const globalShotNum = Number(shotId);
+                            const shotId = shotFile.split('.')[0]; // e.g. "grid2_6" or legacy "19"
                             const gridIdx = viewingExtracted as number;
-                            // Determine which slot (1-9) this shot occupies within its grid
-                            const slotWithinGrid = ((globalShotNum - 1) % 9) + 1;
-                            // Resolve source image: check shotAssignments first, fall back to approved
-                            // Note: imageApprovals keys come from JSON as strings even when typed as number
+                            // Parse new format grid{N}_{slot}.png
+                            const newFmt = shotId.match(/^grid(\d+)_(\d+)$/i);
+                            const slotWithinGrid = newFmt
+                              ? Number(newFmt[2])
+                              : ((Number(shotId) - 1) % 9) + 1; // legacy fallback
+                            // Resolve source image from shotAssignments
                             const assignedFilename =
                               shotAssignments[gridIdx]?.[slotWithinGrid] ??
-                              imageApprovals[String(gridIdx)] ??
-                              (imageApprovals as any)[gridIdx] ??
                               projectGridImages.find(f => {
                                 const gs = `Grid ${gridIdx + 1}`;
                                 return f.startsWith(gs + '.') || f.startsWith(gs + ' ');
@@ -2026,9 +2663,11 @@ export default function Home() {
                           <button
                             onClick={() => {
                               const shotId = shotFile.split('.')[0];
-                              const globalNum = Number(shotId);
                               const gridIdx = viewingExtracted as number;
-                              const slot = ((globalNum - 1) % 9) + 1;
+                              const newFmt2 = shotId.match(/^grid(\d+)_(\d+)$/i);
+                              const slot = newFmt2
+                                ? Number(newFmt2[2])
+                                : ((Number(shotId) - 1) % 9) + 1; // legacy fallback
                               const desc = gridDescriptions[gridIdx];
                               
                               // Compose full prompt: Style + Setting + Shot Description
@@ -2073,27 +2712,30 @@ export default function Home() {
                   </div>
               ) : (
                 <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(280px, 1fr))', gap: 20 }}>
-                  {Object.entries(imageApprovals)
-                    .sort(([a], [b]) => Number(a) - Number(b))
-                    .map(([gridIdxStr, filename]) => {
-                      const gridIdx = Number(gridIdxStr);
-
-                      // Available images for this grid (for the shot source picker)
-                      const gridStrOld = `Grid-${gridIdx + 1}`;
+                  {Array.from(new Set([
+                    ...Object.keys(shotAssignments).map(Number),
+                    ...Object.keys(extractedShots).map(Number),
+                  ])).sort((a, b) => a - b)
+                    .map((gridIdx) => {
+                      // Available images for this grid
                       const gridStrNew = `Grid ${gridIdx + 1}`;
                       const availableImages = projectGridImages.filter(f =>
-                        f.includes(gridStrOld) || f.startsWith(gridStrNew + '.') || f.startsWith(gridStrNew + ' ')
+                        f.startsWith(gridStrNew + '.') || f.startsWith(gridStrNew + ' ')
                       );
 
-                      // Current assignments for this grid (defaults to approved filename)
+                      // Current assignments for this grid
                       const gridAssignments: Record<number, string> = shotAssignments[gridIdx] ?? {};
 
-                      // Build the assignments array to send (only slots that differ from the default, or all if configured)
-                      const hasCustomAssignments = Object.values(gridAssignments).some((f: string) => f !== filename);
+                      // Preview image: first assigned file, or first available grid image
+                      const firstAssigned = Object.values(gridAssignments)[0] ?? availableImages[0] ?? '';
+                      const filename = firstAssigned;
+
+                      // All slots assigned (could be all same image or mixed)
+                      const hasCustomAssignments = Object.keys(gridAssignments).length > 0;
                       const buildAssignmentsPayload = () =>
-                        Array.from({ length: 9 }, (_, i) => i + 1).map(slot => ({
-                          shotIndex: slot,
-                          filename: gridAssignments[slot] ?? filename,
+                        Object.entries(gridAssignments).map(([slot, fn]) => ({
+                          shotIndex: Number(slot),
+                          filename: fn,
                         }));
 
                       const isConfigOpen = configGridIdx === gridIdx;

@@ -4,7 +4,7 @@ import { NextResponse } from 'next/server';
 import fs from 'fs/promises';
 import path from 'path';
 import { isBrowserOpen, openBrowser, openAIFlow, openChatGPT, openGrok, extractShotInGrok, editShotInGrok, downloadShotFromGrok, generateVideoInGrok, editVideoInGrok, upscaleVideoInGrok, resetBrowserProfile, sendTextToChatGPT, fillAIFlowPrompt, submitAIFlowPrompt, getGridImageUrl, triggerGridDownload, renameFlowTitle } from '@/app/BrowserManager';
-
+import { emitProgress } from '@/app/progressEmitter';
 
 async function saveFailureArtifacts(page: { screenshot: (options: { path: string; fullPage?: boolean }) => Promise<Buffer>; url: () => string }, paths: ReturnType<typeof getProjectPaths>, gridIndex: number, reason: string) {
   const failureBase = `grid-${gridIndex + 1}-failure`;
@@ -337,12 +337,21 @@ export async function GET() {
     
     const extractedShots: Record<number, string[]> = {};
     for (const filename of extractedShotsArray) {
-      const globalShotNumMatch = filename.match(/^(\d+)\.png$/);
-      if (globalShotNumMatch) {
-         const globalShotNumber = Number(globalShotNumMatch[1]);
-         const gridIndex = Math.floor((globalShotNumber - 1) / 9);
-         if (!extractedShots[gridIndex]) extractedShots[gridIndex] = [];
-         extractedShots[gridIndex].push(filename);
+      // New format: grid{N}_{slot}.png (e.g. grid3_1.png → Grid 3, Slot 1)
+      const newFmt = filename.match(/^grid(\d+)_(\d+)\.png$/i);
+      if (newFmt) {
+        const gridIndex = Number(newFmt[1]) - 1;   // 0-indexed
+        if (!extractedShots[gridIndex]) extractedShots[gridIndex] = [];
+        extractedShots[gridIndex].push(filename);
+        continue;
+      }
+      // Legacy format: {globalShotNumber}.png (e.g. 19.png → Grid 3)
+      const legacyFmt = filename.match(/^(\d+)\.png$/);
+      if (legacyFmt) {
+        const globalShotNumber = Number(legacyFmt[1]);
+        const gridIndex = Math.floor((globalShotNumber - 1) / 9);
+        if (!extractedShots[gridIndex]) extractedShots[gridIndex] = [];
+        extractedShots[gridIndex].push(filename);
       }
     }
     
@@ -391,6 +400,15 @@ export async function GET() {
       videoPrompts: (metadata as any).videoPrompts || {},
       hasGptConversation: !!(metadata as any).gptConversationUrl,
       gptResponse: raw,
+      // Backfill for projects generated before the generatedGrids tag system:
+      // - metadata.generatedGrids  → new system (set on download)
+      // - flowTitles keys          → set by watch-and-download since day 1 (best backfill signal)
+      // - imageApprovals keys      → user already picked a best image (definitely generated)
+      generatedGrids: Array.from(new Set([
+        ...((metadata as any).generatedGrids || []) as number[],
+        ...Object.keys((metadata as any).flowTitles || {}).map(Number),
+        ...Object.keys(imageApprovals).map(Number).filter(n => !isNaN(n)),
+      ])).sort((a, b) => a - b),
     });
 
 }
@@ -480,12 +498,23 @@ export async function PUT(request: Request) {
 
           const updatedMetadata = {
               ...metadata,
-              flowTitles: { ...((metadata as any).flowTitles || {}), [gridIndex]: `Grid ${gridIndex + 1}` }
+              flowTitles: { ...((metadata as any).flowTitles || {}), [gridIndex]: `Grid ${gridIndex + 1}` },
+              // ── Persistent "created" tag ──────────────────────────────────────
+              // Added as soon as images are confirmed on disk — never requires
+              // manual approval, survives page refresh.
+              generatedGrids: Array.from(new Set([
+                  ...((metadata as any).generatedGrids || []),
+                  gridIndex,
+              ])),
           };
           await saveProjectMetadata(paths.metadataPath, updatedMetadata as any);
 
-          console.log('[open-browser] watch-and-download: complete', { savedPaths });
-          return NextResponse.json({ ok: true, savedPaths, matchCount: savedPaths.length, flowTitle: `Grid ${gridIndex + 1}` });
+          console.log('[open-browser] watch-and-download: complete', { savedPaths, generatedGrids: updatedMetadata.generatedGrids });
+          return NextResponse.json({
+              ok: true, savedPaths, matchCount: savedPaths.length,
+              flowTitle: `Grid ${gridIndex + 1}`,
+              generatedGrids: updatedMetadata.generatedGrids,
+          });
       }
 
       // ── CALL 1: Fill + submit the character prompt, return immediately ──
@@ -502,6 +531,7 @@ export async function PUT(request: Request) {
           const char = characters.find(c => c.id === characterId);
           if (!char) return NextResponse.json({ ok: false, error: 'Character not found.' }, { status: 404 });
 
+          emitProgress({ pipeline: 'character', label: 'Opening AI Flow…', step: 1, total: 5, pct: 5, subLabel: char.name });
           const metadata = await readProjectMetadata(paths.metadataPath);
           const { page } = await openAIFlow(projectName, metadata.aiFlowUrl);
 
@@ -518,12 +548,15 @@ export async function PUT(request: Request) {
               `Character: ${char.description}`,
           ].join('\n');
 
+          emitProgress({ pipeline: 'character', label: 'Filling character prompt…', step: 2, total: 5, pct: 20, subLabel: char.name });
           const filled = await fillAIFlowPrompt(page, prompt);
           if (!filled) return NextResponse.json({ ok: false, error: 'Could not fill the AI Flow prompt.' }, { status: 500 });
 
+          emitProgress({ pipeline: 'character', label: 'Submitting prompt…', step: 3, total: 5, pct: 35, subLabel: char.name });
           const submitted = await submitAIFlowPrompt(page);
           if (!submitted) return NextResponse.json({ ok: false, error: 'Could not submit the AI Flow prompt.' }, { status: 500 });
 
+          emitProgress({ pipeline: 'character', label: 'Prompt submitted — waiting for generation…', step: 3, total: 5, pct: 40, subLabel: char.name });
           console.log('[open-browser] char-submit: prompt submitted for', char.name);
           return NextResponse.json({ ok: true, characterName: char.name });
       }
@@ -758,6 +791,7 @@ export async function PUT(request: Request) {
           }
 
           console.log('[open-browser] openAIFlow', { projectName, savedUrl: metadata.aiFlowUrl });
+          emitProgress({ pipeline: 'grid', label: 'Opening AI Flow…', step: 1, total: 5, pct: 5, subLabel: loadedGridIndex !== null ? `Grid ${loadedGridIndex + 1}` : 'Grid' });
           const { page, projectState } = await openAIFlow(projectName, metadata.aiFlowUrl);
           
           const currentUrl = page.url();
@@ -790,9 +824,13 @@ export async function PUT(request: Request) {
               });
 
               console.log('[open-browser] injecting character references', { characterMap });
-              
+              emitProgress({ pipeline: 'grid', label: 'Injecting character references…', step: 2, total: 5, pct: 15, subLabel: `Grid ${loadedGridIndex + 1}` });
               const promptLoaded = await fillAIFlowPrompt(page, gridText, previousFlowTitle, characterMap);
+              emitProgress({ pipeline: 'grid', label: 'Submitting grid prompt…', step: 3, total: 5, pct: 30, subLabel: `Grid ${loadedGridIndex + 1}` });
               generationTriggered = promptLoaded ? await submitAIFlowPrompt(page) : false;
+              if (generationTriggered) {
+                emitProgress({ pipeline: 'grid', label: 'Prompt submitted — waiting for generation…', step: 3, total: 5, pct: 38, subLabel: `Grid ${loadedGridIndex + 1}` });
+              }
               console.log('[open-browser] generation started for grid', { loadedGridIndex: loadedGridIndex + 1, generationTriggered, previousFlowTitle, characterMap });
           }
 
@@ -847,7 +885,7 @@ export async function PUT(request: Request) {
           gridIndex, 
           imagePath, 
           extractedPath,
-          async (shotId, url) => {
+          async (shotId: string, url: string) => {
             const metadata = await readProjectMetadata(paths.metadataPath);
             const updatedMetadata = {
               ...metadata,

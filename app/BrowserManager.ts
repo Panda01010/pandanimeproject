@@ -1,6 +1,7 @@
 import { chromium, type BrowserContext, type Locator, type Page } from "playwright";
 import path from "path";
 import fs from "fs";
+import { emitProgress } from '@/app/progressEmitter';
 
 const log = (...args: unknown[]) => console.log("[BrowserManager]", ...args);
 const logError = (...args: unknown[]) => console.error("[BrowserManager]", ...args);
@@ -313,12 +314,21 @@ export async function fillAIFlowPrompt(
     // Don't add a trailing space here, as the original text script handles spacing
   };
 
-  // 1. Inject previousFlowTitle first (scene continuity reference) as a standalone reference block
+  // 1. Inject previousFlowTitle @reference FIRST (same order as before — proven to work).
+  // The Enter key inside injectAtReference selects from the dropdown; putting text
+  // before the @ref caused that Enter to submit the prefix as a separate message.
+  // We add the instruction AFTER the chip so Flow still knows what it's for.
   if (previousFlowTitle) {
     await injectAtReference(previousFlowTitle);
-    await page.keyboard.insertText('\n\n'); // Separate from the main script
+    await page.keyboard.insertText(
+      ' [Character & style reference ONLY — use this to keep the same character faces, ' +
+      'art style, and visual quality. The scene location, background, setting, and action ' +
+      'are described in the script below and are completely new. ' +
+      'Do NOT copy or reuse the previous scene\'s environment or events.]\n\n'
+    );
     await page.waitForTimeout(200);
   }
+
 
   // 2. Type out the script chronologically and inject character blocks inline
   if (!characterReferences || Object.keys(characterReferences).length === 0) {
@@ -381,6 +391,8 @@ export async function watchAndDownloadCharacter(
 ): Promise<string[]> {
   log('watchAndDownloadCharacter', { charId, timeoutMs });
   await fs.promises.mkdir(downloadPath, { recursive: true });
+
+  emitProgress({ pipeline: 'character', label: `Watching for ${charName} generation…`, step: 1, total: 5, pct: 10, subLabel: charName });
 
   // Extract the unique part of the prompt — everything after "Character: "
   // Use only the first 40 chars for matching: the DOM truncates long descriptions with "..."
@@ -445,6 +457,7 @@ export async function watchAndDownloadCharacter(
       // ── 3. Open full-screen detail view ──────────────────────────────────
       // Clicking a thumbnail opens a full-screen detail view (not a sidebar).
       // The reliable signal it's open is the "Download" button appearing top-right.
+      emitProgress({ pipeline: 'character', label: 'Opening image detail view…', step: 2, total: 5, pct: 30, subLabel: charName });
       await thumb.click();
       await page.waitForSelector(
         'button:has-text("Download"), button[aria-label*="download" i]',
@@ -455,6 +468,7 @@ export async function watchAndDownloadCharacter(
       // No fixed sleep — waitForSelector already guarantees the view is ready
 
       // ── 4. Expand via Grandir and read the full prompt ────────────────────
+      emitProgress({ pipeline: 'character', label: 'Verifying prompt match…', step: 3, total: 5, pct: 50, subLabel: charName });
       const sidebarPrompt = await extractAndExpandSidebarPrompt(page);
       const normSidebar = sidebarPrompt.replace(/\s+/g, ' ').trim();
 
@@ -490,14 +504,17 @@ export async function watchAndDownloadCharacter(
       const destPath  = path.join(downloadPath, filename);
 
       // Rename immediately — no need to read current title first
+      emitProgress({ pipeline: 'character', label: `Renaming scene to "${targetTitle}"…`, step: 4, total: 5, pct: 70, subLabel: charName });
       await renameFlowTitle(page, targetTitle);
       log(`renamed scene title → "${targetTitle}"`);
 
       // Download immediately
+      emitProgress({ pipeline: 'character', label: `Downloading variation ${variationIndex}…`, step: 5, total: 5, pct: 85 + (variationIndex * 7), subLabel: charName });
       try {
         await triggerGridDownload(page, destPath);
         savedPaths.push(destPath);
         log(`downloaded variation ${variationIndex}`, { destPath });
+        emitProgress({ pipeline: 'character', label: `Variation ${variationIndex} saved ✓`, step: 5, total: 5, pct: savedPaths.length >= 2 ? 100 : 92, subLabel: charName, done: savedPaths.length >= 2 });
       } catch (err) {
         logError(`failed to download variation ${variationIndex}`, err);
       }
@@ -798,7 +815,7 @@ export async function extractShotInGrok(
   gridIndex: number, 
   imagePath: string, 
   extractedPath: string,
-  onShotSaved?: (shotId: number, url: string) => Promise<void>,
+  onShotSaved?: (shotId: string, url: string) => Promise<void>,
   minDelayMs = 10000,
   maxDelayMs = 20000,
   shotAssignments?: { shotIndex: number; imagePath: string }[]   // per-shot overrides
@@ -826,16 +843,30 @@ export async function extractShotInGrok(
   for (let i = 0; i < shotsToRun.length; i++) {
     const shotIndex = shotsToRun[i];
     const thisImagePath = assignmentMap[shotIndex] ?? imagePath;
-    const globalShotNumber = (gridIndex * 9) + shotIndex;
-    const extractedFilename = `${globalShotNumber}.png`;
+    // Per-grid naming: grid{N}_{slot}.png — always starts at slot 1 for every grid
+    const shotFileKey = `grid${gridIndex + 1}_${shotIndex}`;
+    const extractedFilename = `${shotFileKey}.png`;
     const extractedFilePath = path.join(extractedPath, extractedFilename);
+
+    const shotPct = Math.round((i / shotsToRun.length) * 90) + 5;
+    emitProgress({ pipeline: 'extraction', label: `Extracting Grid ${gridIndex + 1} Shot ${shotIndex} (${i + 1}/${shotsToRun.length})…`, step: i + 1, total: shotsToRun.length, pct: shotPct, subLabel: `Grid ${gridIndex + 1}` });
+
+    // ── RESUME: skip shots already on disk ───────────────────────────────────
+    const alreadyOnDisk = await fs.promises.access(extractedFilePath).then(() => true).catch(() => false);
+    if (alreadyOnDisk) {
+      log(`Skipping ${shotFileKey} — already extracted on disk`);
+      emitProgress({ pipeline: 'extraction', label: `Shot ${shotIndex} already done ✓ (Grid ${gridIndex + 1})`, step: i + 1, total: shotsToRun.length, pct: shotPct, subLabel: `Grid ${gridIndex + 1}` });
+      extractedPaths.push(extractedFilePath);
+      continue;
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 
     let downloadSuccess = false;
     let attempts = 0;
 
     while (!downloadSuccess && attempts < 2) {
       attempts++;
-      log(`Extracting Grid ${gridIndex + 1}, Shot ${shotIndex} (Global: ${globalShotNumber}) from ${path.basename(thisImagePath)} - Attempt ${attempts}`);
+      log(`Extracting Grid ${gridIndex + 1}, Shot ${shotIndex} (${shotFileKey}) from ${path.basename(thisImagePath)} - Attempt ${attempts}`);
 
       const context = await BrowserManager.openBrowser();
       const page = await context.newPage();
@@ -976,26 +1007,47 @@ export async function extractShotInGrok(
           }
         }
 
-        log(`Waiting for generation of shot ${shotIndex}...`);
+        log(`Waiting for Grok to finish generating shot ${shotIndex}...`);
+        emitProgress({ pipeline: 'extraction', label: `Waiting for Grok to generate Grid ${gridIndex + 1} Shot ${shotIndex}…`, step: i + 1, total: shotsToRun.length, pct: shotPct, subLabel: `Grid ${gridIndex + 1}` });
+
+        // First: wait for Grok to enter "generating" state (so we know it actually started)
+        await page.waitForFunction(() => {
+          const body = document.body?.innerText ?? '';
+          const ariabusy = !!document.querySelector('[aria-busy="true"], [data-state="loading"]');
+          return /generating|loading|working|queued|processing/i.test(body) || ariabusy;
+        }, { timeout: 30000, polling: 400 }).catch(() => {
+          log('generating state not detected in 30s — continuing anyway');
+        });
+
+        // Then: wait until Grok is DONE generating AND a new Download button has appeared
         await page.waitForFunction(
-          (initial: number) => document.querySelectorAll('button[aria-label="Download"]').length > initial,
+          (initial: number) => {
+            const body = document.body?.innerText ?? '';
+            const isStillGenerating =
+              /generating|loading|working|queued|processing/i.test(body) ||
+              !!document.querySelector('[aria-busy="true"], [data-state="loading"]');
+            const downloadCount = document.querySelectorAll('button[aria-label="Download"]').length;
+            // Only accept once: (a) new Download button AND (b) generation is no longer active
+            return downloadCount > initial && !isStillGenerating;
+          },
           initialDownloadCount,
-          { timeout: 120000, polling: 300 }
+          { timeout: 120000, polling: 500 }
         );
 
         // Download
         await page.locator('button[aria-label="Download"]').last().click();
         const download = await downloadPromise;
         await download.saveAs(extractedFilePath);
-        log(`Saved shot ${globalShotNumber} to ${extractedFilePath}`);
+        log(`Saved grid${gridIndex + 1}_${shotIndex} to ${extractedFilePath}`);
+        emitProgress({ pipeline: 'extraction', label: `Shot ${shotIndex} saved ✓ (Grid ${gridIndex + 1})`, step: i + 1, total: shotsToRun.length, pct: Math.round(((i + 1) / shotsToRun.length) * 100), subLabel: `Grid ${gridIndex + 1}`, done: i + 1 === shotsToRun.length });
         
-        // Capture the source URL for editing (Memory feature)
+        // Capture the source URL — keyed by grid{N}_{slot}
         const currentUrl = page.url();
-        shotSources[globalShotNumber] = currentUrl;
+        shotSources[shotFileKey] = currentUrl;
         
         // INCREMENTAL SAVE: persist URL immediately
         if (onShotSaved) {
-          await onShotSaved(globalShotNumber, currentUrl).catch(e => logError('Incremental save failed', e));
+          await onShotSaved(shotFileKey, currentUrl).catch(e => logError('Incremental save failed', e));
         }
 
         downloadSuccess = true;
@@ -1488,6 +1540,9 @@ export async function watchAndDownloadGrid(
   log(`watchAndDownloadGrid starting for Grid ${gridIndex + 1}`, { timeoutMs });
   await fs.promises.mkdir(downloadPath, { recursive: true });
 
+  const gridLabel = `Grid ${gridIndex + 1}`;
+  emitProgress({ pipeline: 'grid', label: `Watching for ${gridLabel} generation…`, step: 1, total: 5, pct: 10, subLabel: gridLabel });
+
   const startTime = Date.now();
   let lastProgressTime = Date.now();
   
@@ -1524,6 +1579,7 @@ export async function watchAndDownloadGrid(
         attemptedIds.add(id);
 
         // 1. Open Detail View — wait for the Download button, same as character pipeline
+        emitProgress({ pipeline: 'grid', label: 'Opening image detail view…', step: 2, total: 5, pct: 30, subLabel: gridLabel });
         await thumb.click();
         await page.waitForSelector(
           'button:has-text("Download"), button[aria-label*="download" i]',
@@ -1533,6 +1589,7 @@ export async function watchAndDownloadGrid(
         });
 
         // 2. Extract and Verify Prompt — use the same fast function as character pipeline
+        emitProgress({ pipeline: 'grid', label: 'Verifying prompt match…', step: 3, total: 5, pct: 50, subLabel: gridLabel });
         log(`verifying sidebar prompt for grid ${gridIndex + 1}...`);
         const sidebarPrompt = await extractAndExpandSidebarPrompt(page);
         
@@ -1575,15 +1632,17 @@ export async function watchAndDownloadGrid(
         const destPath = path.join(downloadPath, filename);
 
         // 4. Rename Scene Title — always rename immediately, no pre-read needed
+        emitProgress({ pipeline: 'grid', label: `Renaming scene to "${targetTitle}"…`, step: 4, total: 5, pct: 70, subLabel: gridLabel });
         await renameFlowTitle(page, targetTitle);
         log(`renamed grid scene title to "${targetTitle}"`);
 
-
         // 5. Download Variation
+        emitProgress({ pipeline: 'grid', label: `Downloading variation ${variationIndex}…`, step: 5, total: 5, pct: 85 + (variationIndex * 7), subLabel: gridLabel });
         try {
             await triggerGridDownload(page, destPath);
             savedPaths.push(destPath);
             log(`downloaded grid variation ${variationIndex}`, { destPath });
+            emitProgress({ pipeline: 'grid', label: `Variation ${variationIndex} saved ✓`, step: 5, total: 5, pct: savedPaths.length >= 2 ? 100 : 92, subLabel: gridLabel, done: savedPaths.length >= 2 });
         } catch (err) {
             logError(`failed to download grid variation ${variationIndex}`, err);
             errorCount++;
@@ -1675,6 +1734,8 @@ export async function resetBrowserProfile() {
  */
 export async function generateVideoInGrok(shotImagePath: string, videoOutputPath: string, compositePrompt: string) {
   log(`Generating video — source: ${path.basename(shotImagePath)}`);
+  const shotId = path.basename(shotImagePath, '.png');
+  emitProgress({ pipeline: 'video', label: 'Opening Grok for video generation…', step: 1, total: 5, pct: 5, subLabel: `Shot ${shotId}` });
   const context = await BrowserManager.openBrowser();
   const page = await context.newPage();
 
@@ -1684,6 +1745,7 @@ export async function generateVideoInGrok(shotImagePath: string, videoOutputPath
     await page.waitForTimeout(1000);
 
     // STEP 1 — Click Video mode radio (language-agnostic via DOM scan)
+    emitProgress({ pipeline: 'video', label: 'Switching to Video mode…', step: 1, total: 5, pct: 15, subLabel: `Shot ${shotId}` });
     log('Clicking Video mode...');
     await page.evaluate(() => {
       const radios = Array.from(document.querySelectorAll<HTMLElement>('button[role="radio"]'));
@@ -1694,6 +1756,7 @@ export async function generateVideoInGrok(shotImagePath: string, videoOutputPath
     await page.waitForTimeout(1500);
 
     // STEP 2 — Click the chat input
+    emitProgress({ pipeline: 'video', label: 'Uploading shot image…', step: 2, total: 5, pct: 30, subLabel: `Shot ${shotId}` });
     log('Clicking chat input...');
     const chatInput = page.locator('[contenteditable="true"], textarea').first();
     await chatInput.waitFor({ state: 'visible', timeout: 15000 });
@@ -1722,6 +1785,7 @@ export async function generateVideoInGrok(shotImagePath: string, videoOutputPath
     await page.waitForTimeout(4000); // give Grok time to process the pasted image
 
     // STEP 5 — Paste the prompt text via clipboard
+    emitProgress({ pipeline: 'video', label: 'Submitting video prompt…', step: 3, total: 5, pct: 45, subLabel: `Shot ${shotId}` });
     log('Pasting prompt text...');
     await chatInput.click();
     await page.evaluate((text: string) => navigator.clipboard.writeText(text), compositePrompt);
@@ -1732,6 +1796,7 @@ export async function generateVideoInGrok(shotImagePath: string, videoOutputPath
     const downloadPromise = page.waitForEvent('download', { timeout: 300000 });
     log('Sending prompt...');
     await page.keyboard.press('Enter');
+    emitProgress({ pipeline: 'video', label: 'Waiting for Grok video generation…', step: 4, total: 5, pct: 55, subLabel: `Shot ${shotId}` });
     log('Waiting for video generation to finish...');
 
     // STEP 7 — Wait for generation to complete
@@ -1744,6 +1809,7 @@ export async function generateVideoInGrok(shotImagePath: string, videoOutputPath
       { timeout: 300000, polling: 1500 }
     );
 
+    emitProgress({ pipeline: 'video', label: 'Downloading video…', step: 5, total: 5, pct: 90, subLabel: `Shot ${shotId}` });
     log('Done — clicking download...');
     await page.waitForTimeout(1500);
     await page.locator('button[aria-label="Download"]').last().click();
@@ -1751,6 +1817,7 @@ export async function generateVideoInGrok(shotImagePath: string, videoOutputPath
     const download = await downloadPromise;
     await download.saveAs(videoOutputPath);
     log(`Video saved to ${videoOutputPath}`);
+    emitProgress({ pipeline: 'video', label: 'Video saved ✓', step: 5, total: 5, pct: 100, subLabel: `Shot ${shotId}`, done: true });
 
     return { success: true, path: videoOutputPath, grokUrl: page.url() };
 
